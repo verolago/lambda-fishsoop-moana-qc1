@@ -1,0 +1,607 @@
+import os
+import logging
+import boto3
+import numpy as np
+import pandas as pd
+import xarray as xr
+import seawater as sw
+import datetime as dt
+from ops_qc.utils import catch, start_end_dist, import_pycallable
+
+xr.set_options(keep_attrs=True)
+
+cycle_dt = dt.datetime.utcnow()
+
+class QcWrapper(object):
+    """
+    Wrapper class for observational data quality control.  Takes a list of csv files containing
+    moana/mangōpare data and outputs qc'd data in netcdf files, one file per csv.  Also creates 
+    a status file that indicates if the qc was successful, and if not, why it wasn't.
+
+    Arguments:
+        filelist -- list of csv files to apply quality control to
+        outfile_ext -- extension to add to filenames when saving as netcdf files
+        out_dir - directory to save qc'd netcdf files in
+        test_list_1 -- list of qc tests to run in the first "batch," these tests should not
+            depend on a previous test
+        test_list_2 -- list of qc tests to run in the second "batch," which may depend on 
+            qc tests in test_list_1
+        fishing_metafile -- path and filename for the csv file that contains fisher metadata,
+            can be a local directory or a csv file in a github repository
+        metafile_username -- used if you need a username to access metafile on github
+        metafile_token -- github token if you need a username to access metafile on github
+        status_file_ext -- extension added to status_file_XXXXXX.csv, usually a datetime
+        status_file_dir -- directory to save status file in, if empty, will use out_dir
+        datareader -- python class to read csv file, returns an xarray dataset
+        preprocessor -- python class to preprocess data from datareader, returns updated
+            xarray dataset and updated status_file
+        qc_class -- python class wrapper for running qc tests, returns updated xarray dataset
+            that includes qc flags and updated status_file
+        save_flags -- boolean, save all qc flags (true) or only global qc flags (false)
+        convert_p_to_z -- boolean, convert pressure to depth (true) or only keep pressure
+            (false)
+        default_latitude -- latitude to use in convert_p_to_z
+        attr_file -- location of attribute_list.yml, default uses the one in the python 
+            package, should be a yaml file (see sample one in ops_qc directory)
+        startstring -- string, used by datareader class to recognize the end of the header
+            or start of the data
+        splitstring -- string, string to look for in error messages, anything before 
+            splitstring will be recorded in status_file_XXXX as "failure_mode", anything
+            after as "detailed_error"
+        gear_class -- dictionary of fishing_method:gear_class pairs, matching every 
+            fishing method in the fishing_metafile to either "mobile" or "stationary"
+
+    Returns:
+        self._success_files -- list of files successfully qc'd and saved as netcdf files
+
+    Outputs:
+        Saves qc'd files as netcdf in out_dir
+        Saves status_file_XXXX as csv in status_file_dir (or if none, out_dir)
+    """
+
+    def __init__(
+        self,
+        event=None,
+        filelist=[],
+        outfile_ext="_qc",
+        out_dir="s3://fishsoop-moana-qc1/",
+        test_list_1=['impossible_date', 'impossible_location', 'impossible_speed', 'timing_gap', 'global_range', 'remove_ref_location', 'spike', 'temp_drift', 'stationary_position_check'],
+        test_list_2=['start_end_dist_check'],
+        fishing_metafile="s3://fishsoop-qc-tools/Trial_fisherman_database_ausTest.csv",
+        metafile_username=[],
+        metafile_token=[],
+        status_file_ext="_%y%m%d",
+        status_file_dir="s3://fishsoop-moana-qc1/status-files/",
+        datareader={},
+        metareader={},
+        preprocessor={},
+        qc_class={},
+        save_flags=False,
+        convert_p_to_z=True,
+        default_latitude=-40,
+        attr_file=os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "attribute_list.yml"
+        ),
+        startstring="DateTime (UTC)",
+        splitstring="due to:",
+        gear_class={
+            "Bottom trawl": "mobile",
+            "Potting": "stationary",
+            "Long lining": "stationary",
+            "Trawling": "mobile",
+            "Midwater trawl": "mobile",
+            "Purse seine netting": "stationary",
+            "Bottom trawling": "mobile",
+            "Research": "mobile",
+            "Education": "mobile",
+            "Bottom trawler": "mobile",
+            "Bottom long line": "mobile",
+            "Waka": "mobile",
+            "Danish seining": "stationary",
+            "Netting": "stationary",
+            "Set netting": "stationary",
+            "Dredge": "mobile",
+            "Instrument deployment": "mobile",
+            "Potting, long lining": "stationary",
+            "Diving": "stationary",
+            "Trolling": "mobile"
+        },
+        logger=logging,
+        **kwargs,
+    ):
+
+        self.event = event
+        self.filelist = filelist
+        self.outfile_ext = outfile_ext
+        #self.out_dir = out_dir
+        # Extract the serial number from the trigger event file name
+        if event and 'Records' in event:
+            records = event['Records']
+            if records and len(records) > 0:
+                record = records[0]
+                if 's3' in record:
+                    s3_record = record['s3']
+                    if 'object' in s3_record:
+                        object_key = s3_record['object']['key']
+                        # Extract the serial number folder (e.g., "0477/") from the object key
+                        serial_number_folder = object_key.split('/')[0] + '/'
+                        # Set out_dir to the provided directory plus the serial number folder
+                        self.out_dir = f"{out_dir}{serial_number_folder}"
+                        self.status_file_dir = f"{status_file_dir}{serial_number_folder}"
+        else:
+            # If no event or no matching data in the event, use the provided out_dir
+            self.out_dir = out_dir
+            self.status_file_dir = status_file_dir
+        self.test_list_1 = test_list_1
+        self.test_list_2 = test_list_2
+        self.metafile = fishing_metafile
+        self.metafile_username = metafile_username
+        self.metafile_token = metafile_token
+        #self.status_file_ext = status_file_ext
+        # Extract numeric extension from the trigger event file name
+        if event and 'Records' in event:
+            records = event['Records']
+            if records and len(records) > 0:
+                record = records[0]
+                if 's3' in record:
+                    s3_record = record['s3']
+                    if 'object' in s3_record:
+                        object_key = s3_record['object']['key']
+                        # Extract the numeric extension (e.g. _0477_22_230515042835)
+                        numeric_extension = object_key.split('/MOANA')[1].replace('.csv', '')
+                        self.status_file_ext = f"{numeric_extension}"
+        else:
+            # If no event or no matching data in the event, use the provided out_dir
+            self.status_file_ext = status_file_ext
+        #self.status_file_dir = status_file_dir
+        self.datareader_class = datareader
+        self.metareader_class = metareader
+        self.preprocessor_class = preprocessor
+        self.qc_class = qc_class
+        self.save_flags = save_flags
+        self.convert_p_to_z = convert_p_to_z
+        self.default_latitude = default_latitude
+        self.attr_file = attr_file
+        self.startstring = startstring
+        self.splitstring = splitstring
+        self.gear_class = gear_class
+        self._default_datareader_class = "ops_qc.readers.MangopareStandardReader"
+        self._default_metareader_class = "ops_qc.readers.MangopareMetadataReader"
+        self._default_preprocessor_class = "ops_qc.preprocess.PreProcessMangopare"
+        self._default_qc_class = "ops_qc.apply_qc.QcApply"
+        self.logger = logging
+        self.status_dict_keys = [
+            "filename",
+            "baseline",
+            "cellular_signal_strength",
+            "date_quality_controlled",
+            "deck_unit_battery_percent",
+            "deck_unit_battery_voltage",
+            "download_time",
+            "gear_class",
+            "max_lifetime_depth",
+            "moana_battery",
+            "moana_serial_number",
+            "moana_calibration_date",
+            "qc=1",
+            "qc=2",
+            "qc=3",
+            "qc=4",
+            "reset_codes",
+            "reset_codes_data",
+            "saved",
+            "failed",
+            "failure_mode",
+            "total_obs",
+            "detailed_error"
+        ]
+        
+    def set_cycle(self, cycle_dt):
+        self.logger.error("In wrapper: _set_cycle")
+        self.cycle_dt = cycle_dt
+        if self.out_dir:
+            self.out_dir = cycle_dt.strftime(self.out_dir)
+        if self.outfile_ext:
+            self.outfile_ext = cycle_dt.strftime(self.outfile_ext)
+
+    #     self._proxy.set_cycle(cycle_dt)
+
+    def _set_class(self, in_class, default_class):
+        self.logger.error("In wrapper: _set_class")
+        klass = in_class.pop("class", default_class)
+        out_class = import_pycallable(klass)
+        self.logger.info("Using class: %s " % klass)
+        return out_class
+
+    def _set_all_classes(self):
+        self.logger.error("In wrapper: _set_all_classes")
+        try:
+            self.datareader = self._set_class(
+                self.datareader_class, self._default_datareader_class
+            )
+            self.metareader = self._set_class(
+                self.metareader_class, self._default_metareader_class
+            )
+            self.preprocessor = self._set_class(
+                self.preprocessor_class, self._default_preprocessor_class
+            )
+            self.qc_class = self._set_class(
+                self.qc_class, self._default_qc_class
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Unable to set required classes for qc: {}".format(exc))
+            raise type(exc)(f'Unable to set requred classes for qc due to: {exc}')
+
+
+    def _set_filelist(self):
+        self.logger.error("In wrapper: _set_filelist")
+        try:
+            if hasattr(self, "_success_files"):
+                self.files_to_qc = self._success_files
+            else:
+                self.files_to_qc = self.filelist
+        except Exception as exc:
+            self.logger.error(
+                "No file list found, please specify.  No QC performed.")
+            raise type(exc)(f'No file list found, no QC performed due to: {exc}')
+
+
+    def _save_qc_data(self, filename):
+        """
+        Save qc'd data as netcdf files.  If no outdir specified,
+        saves in same directory as original file.
+        """
+        self.logger.error("In wrapper: _save_qc_data")
+        try:
+            """
+            head, tail = os.path.split(filename)
+            
+            if not self.out_dir:
+                self.out_dir = head
+            # create (mkdir) out_dir if it doesn't exist
+            self._initialize_outdir(self.out_dir)
+            savefile = "{}{}{}{}".format(
+                self.out_dir, os.path.splitext(
+                    tail)[0], self.outfile_ext, ".nc"
+            )
+            self.ds.to_netcdf(savefile, mode="w", format="NETCDF4")
+            # self._saved_files.append(savefile)
+            self.status_dict.update({"saved": "yes"})
+            self._saved_files.append(savefile)
+            """
+            
+            head, tail = os.path.split(filename)
+
+            # Extract the bucket name and prefix from out_dir
+            out_dir_parts = self.out_dir.split('/')
+            bucket_name = out_dir_parts[2]
+            prefix = '/'.join(out_dir_parts[3:])
+    
+            # Construct the S3 key for the file
+            s3_key = os.path.join(prefix, os.path.splitext(tail)[0] + self.outfile_ext + ".nc")
+    
+            # Create the NetCDF file
+            savefile = "/tmp/{}.nc".format(os.path.splitext(tail)[0] + self.outfile_ext)
+            self.ds.to_netcdf(savefile, mode="w", format="NETCDF4")
+    
+            # Create an S3 client
+            s3 = boto3.client('s3')
+    
+            # Upload the NetCDF file to the S3 bucket
+            with open(savefile, 'rb') as file:
+                s3.upload_fileobj(file, Bucket=bucket_name, Key=s3_key)
+    
+            # Update the status dictionary
+            self.status_dict.update({"saved": "yes"})
+            self._saved_files.append(s3_key)
+    
+            # Clean up the local NetCDF file
+            os.remove(savefile)
+        
+        except Exception as exc:
+            self.status_dict.update(
+                {"failed": "yes", "failure_mode": "Save QC File Failed"}
+            )
+            self.logger.error(
+                "Could not save qc data from {}: {}".format(filename, exc)
+            )
+            # self._failed_files.append(f'{filename}: Save QC File Failed')
+
+    def _save_status_data(self):
+        """
+        Save self._success_files and self._failed_files as text files.
+        If status_file_dir is not specified, saves in same directory as
+        qc'd data.
+        """
+        self.logger.error("In wrapper: _save_status_data")
+        try:
+            s3 = boto3.client('s3')
+            
+            if not self.status_file_dir:
+                self.status_file_dir = self.out_dir
+            
+            # Extract the bucket name from the S3 path
+            bucket_name = self.out_dir.replace('s3://', '').split('/')[0]
+    
+            # Define the S3 object key for the status filename
+            basefile = f"status_file{self.status_file_ext}.csv"
+            filename = cycle_dt.strftime(os.path.join(
+                self.status_file_dir.lstrip('s3:/').lstrip('/').lstrip(bucket_name).lstrip('/'),basefile))
+            
+            self.logger.error("In _save_status_data: {}".format(filename))
+    
+            # Save the status data directly to the specified S3 bucket and object key
+            with open('/tmp/status_file.csv', 'w') as file:
+                self._status_data.to_csv(file, mode="a", header=not os.path.isfile(filename), index=False)
+    
+            # Upload the temporary file to the specified S3 bucket and object key
+            s3.upload_file('/tmp/status_file.csv', bucket_name, filename)
+
+        except Exception as exc:
+            self.logger.error("Could not save status files to S3: {}".format(exc))
+
+    def _initialize_outdir(self, dir_path):
+        """
+        Check if outdir exists, create if not
+        """
+        self.logger.error("In wrapper: _initialize_outdir")
+        # Extract bucket name and key from the S3 path
+        bucket_name = dir_path.split("//")[1].split("/")[0]
+        key = "/".join(dir_path.split("//")[1].split("/")[1:])
+        
+        s3 = boto3.client('s3')
+        
+        try:
+            # Attempt to list objects in the specified S3 bucket
+            s3.list_objects_v2(Bucket=bucket_name, Prefix=key)
+            
+            # Create the folder if it doesn't exist
+            if key:
+                s3.put_object(Bucket=bucket_name, Key=key + '/')  # Create a folder by adding a trailing slash
+                
+        except Exception as exc:
+            self.logger.error(
+                "Could not ensure the existence of the specified S3 bucket or folder: {}".format(exc)
+            )
+            raise type(exc)(f'Could not ensure the existence of the specified S3 bucket or folder due to: {exc}')
+
+    def convert_pressure_to_depth(self):
+        """
+        Converts pressure to depth in the ocean either using the
+        mean latitude of the observations or using a default_latitude
+        """
+        self.logger.error("In wrapper: convert_pressure_to_depth")
+        try:
+            if not np.isnan(np.nanmean(self.ds["LATITUDE"])):
+                d_lat = np.nanmean(self.ds["LATITUDE"])
+            else:
+                d_lat = self.default_latitude
+            depth = [
+                sw.eos80.dpth(catch(lambda: float(z)), d_lat)
+                for z in self.ds["PRESSURE"]
+            ]
+            self.ds["DEPTH"] = xr.Variable(
+                dims="DATETIME",
+                data=depth,
+                attrs={"units": "[m]", "standard_name": "depth"},
+            )
+            self.ds = self.ds.drop("PRESSURE")
+            self.ds = self.ds.rename({"PRESSURE_QC": "DEPTH_QC"})
+            return self.ds
+        except Exception as exc:
+            self.logger.error(
+                "Could not convert pressure to depth, leaving as pressure: {}".format(
+                    exc
+                )
+            )
+            pass
+
+    def _calc_positions(self, filename, surface_pressure=10, qcrange=[1,2]):
+        """
+        Calculate locations for either stationary or mobile gear.
+        Current state of this code assumes all stationary locations
+        in one CSV file are the SAME.  NOT NECESSARILY TRUE!  Hence
+        the commented out regions...eventually will use those.
+        """
+        self.logger.error("In wrapper: _calc_positions")
+        try:
+            if self.ds.attrs['gear_class'] == 'stationary':
+                # this needs work
+                if 'LOCATION_QC' in self.ds.data_vars:
+                    ds2 = self.ds.where(self.ds['LOCATION_QC'].isin(qcrange), drop=True)
+                else:
+                    ds2 = self.ds
+                if 'DATETIME_QC' in ds2.data_vars:
+                    ds2 = ds2.where(
+                        ds2['DATETIME_QC'].isin(qcrange), drop=True)
+                lat = np.nanmean(
+                    [ds2.LATITUDE.values[0], ds2.LATITUDE.values[-1]])
+                lon = np.nanmean(
+                    [ds2.LONGITUDE.values[0], ds2.LONGITUDE.values[-1]]) % 360
+                self.ds['LATITUDE'] = self.ds.LATITUDE.where(self.ds.LATITUDE == lat, other=lat)
+                self.ds['LONGITUDE'] = self.ds.LONGITUDE.where(self.ds.LONGITUDE == lon, other=lon)
+            if self.ds.attrs['gear_class'] == 'mobile':
+                self.ds = self.ds.assign({"LONGITUDE": lambda ds: ds['LONGITUDE'] % 360})
+        except Exception as exc:
+            self.logger.error(
+                f"Position could not be calculated for {filename}: {exc}")
+            raise type(exc)(f'Could not calculate stationary positions (len={len(self.ds.TEMPERATURE)}) due to: {exc}')
+
+    def _calc_location_attrs(self,filename):
+        """
+        Assigns derived position attributes to netdf and
+        calculates the start_end_dist
+        """
+        self.logger.error("In wrapper: _calc_location_attrs")
+        try:
+            self.ds.attrs['geospatial_lat_max'] = "%.6f" % np.nanmax(
+                self.ds.LATITUDE.values)
+            self.ds.attrs['geospatial_lat_min'] = "%.6f" % np.nanmin(
+                self.ds.LATITUDE.values)
+            self.ds.attrs['geospatial_lon_max'] = "%.6f" % np.nanmax(
+                self.ds.LONGITUDE.values)
+            self.ds.attrs['geospatial_lon_min'] = "%.6f" % np.nanmin(
+                self.ds.LONGITUDE.values)
+            sed = start_end_dist(self.ds)
+            self.ds.attrs['start_end_dist_m'] = "%.2f" % sed
+        except Exception as exc:
+            self.logger.error(
+                f"Position attrs not assigned for {filename}: {exc}")
+            raise type(exc)(f'Position attrs or start_end_dist not assigned due to: {exc}')
+
+
+    def _postprocess(self, filename):
+        """
+        If gear class is not unknown, apply QC, convert pressure to depth
+        if desired, check if any bad data, save file.
+        """
+        self.logger.error("In wrapper: _postprocess")
+        try:
+            # only save files with at least some good data
+            if np.nanmin(self.ds["QC_FLAG"]) < 4:
+                if self.convert_p_to_z:
+                    self.ds = self.convert_pressure_to_depth()
+                self._save_qc_data(filename)
+                self.status_dict["total_obs"] = len(self.ds["DATETIME"])
+                # this is annoying but it didn't want to unpack single tuples...
+                values, counts = np.unique(
+                    self.ds["QC_FLAG"].values, return_counts=True
+                )
+                if len(values) > 1:
+                    for values, counts in zip(values, counts):
+                        self.status_dict[f"qc={values}"] = counts
+                else:
+                    self.status_dict[f"qc={values[0]}"] = counts[0]
+            else:
+                self.status_dict.update(
+                    {"failed": "yes",
+                        "failure_mode": "No Good Data (all QC Flags = 4)"}
+                )
+        except Exception as exc:
+            self.status_dict.update(
+                {"failed": "yes", "failure_mode": "Post-Processing Failed"})
+            self.logger.error(
+                f"Could not postprocess {filename} due to {exc}")
+
+    def _qc_files(self, test_list, filename):
+        self.logger.error("In wrapper: _qc_files")
+        try:
+            self.ds = self.qc_class(
+                self.ds,
+                test_list,
+                self.save_flags,
+                self.attr_file,
+                ).run()
+        except Exception as exc:
+            self.status_dict.update(
+                {"failed": "yes", "failure_mode": "Apply QC Tests Failed"})
+            self.logger.error(
+                f"Could not qc {filename} due to {exc}")
+
+    def _update_status(self, filename):
+        self.logger.error("In wrapper: _update_status")
+        try:
+            status_dict2 = {
+                k: self.status_dict[k]
+                for k in self.status_dict_keys
+                if k in self.status_dict
+            }
+            status_dict2['filename'] = filename
+            #self._status_data = self._status_data.append(
+            #    status_dict2, ignore_index=True)
+            self._status_data = pd.concat([self._status_data, pd.DataFrame([status_dict2])], ignore_index=True)
+        except Exception as exc:
+            self.logger.error(f"Could not append status info for {filename} due to {exc}")
+
+    def _status_checks(self, filename):
+        self.logger.error("In wrapper: _status_checks")
+        check_passed = True
+        if not hasattr(self.ds, "expected_deck_unit_serial_number"):
+            if "failed" not in self.status_dict:
+                self.status_dict.update(
+                    {
+                        "failed": "yes",
+                        "failure_mode": "Expected deck unit unknown.",
+                    }
+                )
+            self._update_status(filename)
+            check_passed = False
+        elif int(self.ds.attrs["deck_unit_serial_number"]) != int(
+            self.ds.attrs["expected_deck_unit_serial_number"]
+        ):
+            self.status_dict.update(
+                {"failed": "yes", "failure_mode": "Deck units do not match!"}
+            )
+            self._update_status(filename)
+            check_passed = False
+        elif self.ds.attrs["gear_class"] == "unknown":
+            self.status_dict.update(
+                {"failed": "yes", "failure_mode": "Gear Class Unknown"}
+            )
+            self._update_status(filename)
+            check_passed = False
+        return check_passed
+
+    def _process_files(self,event):
+        """Read, reprocess, and apply qc"""
+        self.logger.error("In wrapper: _process_files")
+        self._status_data = pd.DataFrame(columns=self.status_dict_keys)
+        self._saved_files = []
+        self._set_filelist()
+
+        # apply qc
+        for filename in self.files_to_qc:
+            self.status_dict = {}
+            try:
+                self.ds = self.datareader(filename=filename, event=event).run(event=event)
+                self.ds, self.status_dict = self.preprocessor(
+                    ds=self.ds,
+                    fisher_metadata=self.fisher_metadata,
+                    attr_file=self.attr_file,
+                    status_dict=self.status_dict
+                ).run()
+                passed = self._status_checks(filename)
+                if not passed:
+                    continue
+                self._qc_files(self.test_list_1,filename)
+                self._calc_location_attrs(filename)
+                self._calc_positions(filename)
+                if self.ds.attrs['gear_class'] == 'stationary':
+                    self._qc_files(self.test_list_2,filename)
+                self._postprocess(filename)
+                self._update_status(filename)
+            except Exception as exc:
+                if self.splitstring in str(exc):
+                    estr = str(exc).split(self.splitstring)
+                    self.status_dict.update({"failed": "yes","failure_mode":estr[0],"detailed_error":estr[1]})
+                else:
+                    self.status_dict.update({"failed": "yes","failure_mode":str(exc),"detailed_error":"NA"})
+                self._update_status(filename)
+                self.logger.error(
+                    "Could not qc data from {}. Traceback: {}".format(
+                        filename, exc)
+                )
+        self._save_status_data()
+        self._success_files = self._saved_files
+
+    def run(self,event):
+        # set all readers/preprocessors
+        self.set_cycle(cycle_dt)
+        self._set_all_classes()
+        # load metadata common for all files
+        self.fisher_metadata = self.metareader(
+            metafile=self.metafile,
+            gear_class=self.gear_class,
+            username=self.metafile_username,
+            token=self.metafile_token,
+        ).run()
+
+        if len(self.filelist) < 1 or not self.filelist:
+            self.logger.info(
+                'No files in filelist, exiting without performing qc and returning "None".'
+            )
+            self._success_files = None
+        else:
+            self._process_files(event)
+        return self._success_files
